@@ -9,13 +9,14 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{error::Error, io, sync::Arc};
+use std::{error::Error, io, sync::Arc, time::Duration};
 use tokio::{
     fs::File,
     io::AsyncWriteExt,
     net::TcpStream,
     select,
     sync::{mpsc, oneshot, watch, RwLock},
+    time::timeout,
     try_join,
 };
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -39,6 +40,8 @@ type AppLock = Arc<RwLock<App>>;
 // TODO Multi-line input
 // TODO ping/pong messages
 // TODO binary/text message modes
+// TODO Allow quitting w/ control-c even if a task hangs
+// TODO Disconnect / reconnect to server
 
 #[derive(Parser)]
 struct CliOpts {
@@ -207,14 +210,15 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> a
     let (action_tx, action_rx) = mpsc::channel(action_buf_size);
     let (quit_tx, quit_rx) = watch::channel(false);
 
-    let conn_fut = {
+    {
         // Initial draw
         let app = app_lock.read().await;
         terminal.draw(|f| ui(f, &app))?;
 
         // Connect to server.
         // TODO: Move this somewhere else?
-        connect_to_server(app.target.clone(), action_tx.clone())
+        let conn_fut = connect_to_server(app.target.clone(), action_tx.clone());
+        tokio::spawn(conn_fut);
     };
 
     // Spawn tasks
@@ -224,7 +228,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> a
     let update_fut = update_state(terminal, action_rx, app_lock, quit_tx);
     info!("app 456");
 
-    try_join!(conn_fut, keys_fut, msgs_fut, update_fut)?;
+    try_join!(keys_fut, msgs_fut, update_fut)?;
     info!("app joined!");
 
     Ok(())
@@ -444,15 +448,27 @@ async fn connect_to_server(url: Url, action_tx: mpsc::Sender<Action>) -> anyhow:
     action_tx.send(action).await?;
 
     // TODO: Add timeout / retry?
-    match connect_async(url).await {
-        Ok((stream, _)) => {
+    let timeout_secs = 3;
+    let timeout_duration = Duration::from_secs(timeout_secs);
+    let conn_fut = connect_async(url);
+    let conn_timeout = timeout(timeout_duration, conn_fut);
+    match conn_timeout.await {
+        Ok(Ok((stream, _))) => {
             let action = new_status_msg_action("Connection established!".to_string());
             action_tx.send(action).await?;
             Ok(stream)
         }
-        Err(err) => {
+        Ok(Err(err)) => {
+            error!("misc conn err: {}", err);
             // TODO: Error style (distinct from status/info)
             let msg = format!("Error connecting to server: {}", err);
+            let action = new_status_msg_action(msg);
+            action_tx.send(action).await?;
+            Err(err.into())
+        }
+        Err(err) => {
+            error!("timeout err: {}", err);
+            let msg = format!("Timed out after {} seconds: {}", timeout_secs, err);
             let action = new_status_msg_action(msg);
             action_tx.send(action).await?;
             Err(err.into())
