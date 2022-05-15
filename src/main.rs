@@ -35,6 +35,11 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 type AppLock = Arc<RwLock<App>>;
 
+// TODO Scrolling messages window
+// TODO Multi-line input
+// TODO ping/pong messages
+// TODO binary/text message modes
+
 #[derive(Parser)]
 struct CliOpts {
     host: String,
@@ -202,11 +207,15 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> a
     let (action_tx, action_rx) = mpsc::channel(action_buf_size);
     let (quit_tx, quit_rx) = watch::channel(false);
 
-    {
+    let conn_fut = {
         // Initial draw
         let app = app_lock.read().await;
         terminal.draw(|f| ui(f, &app))?;
-    }
+
+        // Connect to server.
+        // TODO: Move this somewhere else?
+        connect_to_server(app.target.clone(), action_tx.clone())
+    };
 
     // Spawn tasks
     info!("app 123");
@@ -215,7 +224,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> a
     let update_fut = update_state(terminal, action_rx, app_lock, quit_tx);
     info!("app 456");
 
-    try_join!(keys_fut, msgs_fut, update_fut)?;
+    try_join!(conn_fut, keys_fut, msgs_fut, update_fut)?;
     info!("app joined!");
 
     Ok(())
@@ -324,7 +333,7 @@ async fn update_state<B: Backend>(
                     app.messages.push(message);
                 }
             },
-            Action::NewMessage(_) => todo!(),
+            Action::NewMessage(message) => app.messages.push(message),
             Action::SetMode(mode) => {
                 app.input_mode = mode;
             }
@@ -425,8 +434,28 @@ fn format_message(message: &Message) -> ListItem<'static> {
     ListItem::new(text)
 }
 
-async fn connect_to_server(url: &Url) -> anyhow::Result<WsStream> {
-    let (stream, _) = connect_async(url).await?;
+fn new_status_msg_action(text: String) -> Action {
+    Action::NewMessage(Message::new(text, MessageKind::Status))
+}
 
-    Ok(stream)
+async fn connect_to_server(url: Url, action_tx: mpsc::Sender<Action>) -> anyhow::Result<WsStream> {
+    let msg = format!("Connecting to {}", url);
+    let action = new_status_msg_action(msg);
+    action_tx.send(action).await?;
+
+    // TODO: Add timeout / retry?
+    match connect_async(url).await {
+        Ok((stream, _)) => {
+            let action = new_status_msg_action("Connection established!".to_string());
+            action_tx.send(action).await?;
+            Ok(stream)
+        }
+        Err(err) => {
+            // TODO: Error style (distinct from status/info)
+            let msg = format!("Error connecting to server: {}", err);
+            let action = new_status_msg_action(msg);
+            action_tx.send(action).await?;
+            Err(err.into())
+        }
+    }
 }
