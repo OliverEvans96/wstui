@@ -33,7 +33,6 @@ pub struct TextArea {
     /// Current position of the cursor in the current string (character index)
     /// (may differ from cursor.pos due to differences in unicode_width)
     line_pos: usize,
-    // TODO: Use string byte index instead of character index?
 }
 
 impl Default for TextArea {

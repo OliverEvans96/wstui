@@ -10,6 +10,7 @@ use clap::Parser;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEvent,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -62,6 +63,7 @@ type AppLock = Arc<RwLock<App>>;
 // TODO Allow quitting w/ control-c even if a tokio task hangs
 // TODO Disconnect / reconnect to server
 // TODO Redraw on window resize.
+// TODO secure connection with wss://
 
 #[derive(Parser)]
 struct CliOpts {
@@ -90,6 +92,8 @@ enum Action {
     SendMessage,
     NewMessage(Message),
     SetMode(InputMode),
+    ScrollUp,
+    ScrollDown,
 }
 
 #[derive(Debug)]
@@ -128,6 +132,8 @@ struct App {
     messages: Vec<Message>,
     /// Target server to connect to
     target: Url,
+    /// Scroll position (first visible line #)
+    scroll_pos: u16,
 }
 
 impl App {
@@ -138,6 +144,23 @@ impl App {
             input_mode: InputMode::Editing,
             messages: Vec::new(),
             target: target_url.parse().expect("Invalid target URL"),
+            scroll_pos: 0,
+        }
+    }
+}
+
+/// Window movement
+impl App {
+    fn scroll_up(&mut self) {
+        // TODO: Bounded scrolling
+        if let Some(next) = self.scroll_pos.checked_sub(1) {
+            self.scroll_pos = next;
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        if let Some(next) = self.scroll_pos.checked_add(1) {
+            self.scroll_pos = next;
         }
     }
 }
@@ -249,6 +272,14 @@ fn handle_normal_input(key: KeyEvent, _app: &App) -> Option<Action> {
     }
 }
 
+fn get_action_from_mouse_event(mouse: MouseEvent, _app: &App) -> Option<Action> {
+    match mouse.kind {
+        event::MouseEventKind::ScrollDown => Some(Action::ScrollDown),
+        event::MouseEventKind::ScrollUp => Some(Action::ScrollUp),
+        _ => None,
+    }
+}
+
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> anyhow::Result<()> {
     let action_buf_size = 1000;
     let (action_tx, action_rx) = mpsc::channel(action_buf_size);
@@ -314,9 +345,9 @@ async fn listen_for_keys(
             Ok(Ok(event)) = get_crossterm_event() => {
                 match event {
                     Event::Key(key) => {
-                        handle_input_action(key, &mut action_tx, &mut app_lock).await?;
+                        handle_key_input_action(key, &mut action_tx, &mut app_lock).await?;
                     }
-                    Event::Mouse(_) => {}
+                    Event::Mouse(mouse) => handle_mouse_input_action(mouse, &mut action_tx, &mut app_lock).await?,
                     Event::Resize(_, _) => {}
                 }
             }
@@ -324,12 +355,11 @@ async fn listen_for_keys(
     }
 }
 
-async fn handle_input_action(
+async fn handle_key_input_action(
     key: KeyEvent,
     action_tx: &mut mpsc::Sender<Action>,
     app_lock: &mut AppLock,
 ) -> anyhow::Result<()> {
-    info!("start handle_input_action");
     let app = app_lock.read().await;
     if let Some(action) = get_action_from_key_event(key, &app) {
         if let Err(err) = action_tx.send(action).await {
@@ -337,7 +367,21 @@ async fn handle_input_action(
         }
     }
 
-    info!("end handle_input_action");
+    Ok(())
+}
+
+async fn handle_mouse_input_action(
+    key: MouseEvent,
+    action_tx: &mut mpsc::Sender<Action>,
+    app_lock: &mut AppLock,
+) -> anyhow::Result<()> {
+    let app = app_lock.read().await;
+    if let Some(action) = get_action_from_mouse_event(key, &app) {
+        if let Err(err) = action_tx.send(action).await {
+            error!("Oops: {}", err);
+        }
+    }
+
     Ok(())
 }
 
@@ -437,6 +481,8 @@ async fn update_state<B: Backend>(
                 app.messages.push(message);
                 app.text_area.update(TextAreaAction::Clear);
             }
+            Action::ScrollUp => app.scroll_up(),
+            Action::ScrollDown => app.scroll_down(),
         }
 
         info!("drawing.");
@@ -473,14 +519,26 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
     handle_input_cursor(f, &app, &input_area);
     f.render_widget(text_input, input_area);
 
-    let messages: Vec<ListItem> = app
+    let messages: Vec<Text> = app
         .messages
         .iter()
         .enumerate()
         .map(|(i, msg)| format_message(i, msg))
         .collect();
-    let messages =
-        List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
+
+    info!("messages: {:#?}", messages);
+
+    let mut all_text = Text::default();
+
+    for message in messages {
+        all_text.extend(message);
+    }
+
+    info!("all_text: {:#?}", all_text);
+
+    let messages = Paragraph::new(all_text)
+        .block(Block::default().borders(Borders::ALL).title("Messages"))
+        .scroll((app.scroll_pos, 0));
     f.render_widget(messages, chunks[2]);
 }
 
@@ -546,15 +604,16 @@ fn create_help_message(app: &App) -> Paragraph {
     Paragraph::new(text)
 }
 
-fn format_message(index: usize, message: &Message) -> ListItem<'static> {
+fn format_message(index: usize, message: &Message) -> Text {
     let style = match message.kind {
         MessageKind::Inbound => Style::default().fg(Color::Green),
-        MessageKind::Outbound => Style::default().fg(Color::Green),
+        MessageKind::Outbound => Style::default().fg(Color::Blue),
         MessageKind::Status => Style::default(),
     };
 
     let ts_str = message.ts.format("%Y-%m-%d %H:%m:%S");
 
+    // Prefix all lines
     let all_prefix = format!("{}: ", index);
     // Prefix first line
     let first_prefix = format!("{:?} [{}]", message.kind, ts_str);
@@ -565,19 +624,25 @@ fn format_message(index: usize, message: &Message) -> ListItem<'static> {
     let prefixes = iter::once(all_prefix.clone() + &first_prefix)
         .chain(iter::repeat(all_prefix + &follow_prefix));
 
-    let lines: Vec<_> = message
-        .text
+    // Replace empty message w/ single newline
+    // so that it will be displayed.
+    let raw_text = if message.text.len() > 0 {
+        &message.text
+    } else {
+        "\n"
+    };
+
+    let lines: Vec<_> = raw_text
         .lines()
         .zip(prefixes)
         .map(|(txt, pre)| format!("{} {}", pre, txt))
         .map(Spans::from)
         .collect();
 
-    let mut text = Text { lines };
-
+    let mut text = Text::from(lines);
     text.patch_style(style);
 
-    ListItem::new(text)
+    text
 }
 
 fn new_status_msg_action(text: String) -> Action {
