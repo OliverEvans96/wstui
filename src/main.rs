@@ -14,6 +14,11 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures_util::{
+    sink::SinkExt,
+    stream::{SplitSink, SplitStream},
+    StreamExt,
+};
 use std::{
     fs::create_dir_all,
     io,
@@ -29,7 +34,7 @@ use tokio::{
     time::timeout,
     try_join,
 };
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::WebSocket, MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tui::{
@@ -40,21 +45,23 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
+use tungstenite::Message as WsMessage;
 use url::Url;
 
 use crate::text_area::Action as TextAreaAction;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsTx = SplitSink<WsStream, WsMessage>;
+type WsRx = SplitStream<WsStream>;
 
 type AppLock = Arc<RwLock<App>>;
 
 // TODO Scrolling messages window
-// TODO Multi-line input
 // TODO ping/pong messages
 // TODO binary/text message modes
-// TODO Allow quitting w/ control-c even if a task hangs
+// TODO Allow quitting w/ control-c even if a tokio task hangs
 // TODO Disconnect / reconnect to server
-// TODO Component trait for composable UI elements
+// TODO Redraw on window resize.
 
 #[derive(Parser)]
 struct CliOpts {
@@ -214,7 +221,6 @@ fn handle_edit_input(key: KeyEvent, _app: &App) -> Option<Action> {
     use KeyCode::*;
     info!("Key press: {:?}", key);
     match (key.code, key.modifiers) {
-        // TODO: Actually send message?
         (Char('d'), KeyModifiers::CONTROL) => Some(Action::SendMessage),
         (Enter, _) => Some(Action::Input(TextAreaAction::NewLine)),
         (Backspace, _) => Some(Action::Input(TextAreaAction::Backspace)),
@@ -252,22 +258,22 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_lock: AppLock) -> a
         // Initial draw
         let app = app_lock.read().await;
         terminal.draw(|f| ui(f, &app))?;
+    }
 
-        // Connect to server.
-        // TODO: Move this somewhere else?
-        let conn_fut = connect_to_server(app.target.clone(), action_tx.clone());
-        tokio::spawn(conn_fut);
+    let ws_target = {
+        let app = app_lock.read().await;
+        app.target.clone()
     };
 
+    let ws_stream = connect_to_server(ws_target, action_tx.clone()).await?;
+    let (ws_tx, ws_rx) = ws_stream.split();
+
     // Spawn tasks
-    info!("app 123");
     let keys_fut = listen_for_keys(action_tx.clone(), app_lock.clone(), quit_rx.clone());
-    let msgs_fut = listen_for_messages(action_tx, app_lock.clone(), quit_rx);
-    let update_fut = update_state(terminal, action_rx, app_lock, quit_tx);
-    info!("app 456");
+    let msgs_fut = listen_for_messages(action_tx, app_lock.clone(), ws_rx, quit_rx);
+    let update_fut = update_state(terminal, action_rx, app_lock, ws_tx, quit_tx);
 
     try_join!(keys_fut, msgs_fut, update_fut)?;
-    info!("app joined!");
 
     Ok(())
 
@@ -339,10 +345,47 @@ async fn handle_input_action(
 async fn listen_for_messages(
     action_tx: mpsc::Sender<Action>,
     app_lock: AppLock,
-    quit_rx: watch::Receiver<bool>,
+    mut ws_rx: WsRx,
+    mut quit_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    // TODO
     info!("listen for messages");
+
+    loop {
+        select! {
+            Ok(()) = quit_rx.changed() => {
+                warn!("Received quit signal");
+                return Ok(())
+            },
+            Some(Ok(msg)) = ws_rx.next() => {
+                match msg {
+                    WsMessage::Text(text) => {
+                        let message = Message::new(text, MessageKind::Inbound);
+                        let action = Action::NewMessage(message);
+                        if let Err(err) = action_tx.send(action).await {
+                            error!("Error displaying received message: {}", err);
+                        }
+                    }
+                    WsMessage::Binary(bytes) => {
+                        let text = if let Ok(text) = std::str::from_utf8(&bytes) {
+                            text.to_string()
+                        } else {
+                            format!("{:?}", bytes)
+                        };
+                        let message = Message::new(text, MessageKind::Inbound);
+                        let action = Action::NewMessage(message);
+                        if let Err(err) = action_tx.send(action).await {
+                            error!("Error displaying received message: {}", err);
+                        }
+                    }
+                    WsMessage::Ping(_) => todo!(),
+                    WsMessage::Pong(_) => todo!(),
+                    WsMessage::Close(_) => todo!(),
+                    WsMessage::Frame(_) => todo!(),
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -351,6 +394,7 @@ async fn update_state<B: Backend>(
     terminal: &mut Terminal<B>,
     mut action_rx: mpsc::Receiver<Action>,
     app_lock: AppLock,
+    mut ws_tx: WsTx,
     quit_tx: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     while let Some(action) = action_rx.recv().await {
@@ -384,8 +428,12 @@ async fn update_state<B: Backend>(
             }
             Action::SendMessage => {
                 let content = app.text_area.content();
-                let message = Message::new(content, MessageKind::Outbound);
-                // TODO: ACTUALLY SEND MESSAGE
+                let message = Message::new(content.clone(), MessageKind::Outbound);
+                let ws_message = WsMessage::Text(content);
+                // TODO: Should this really happen in update loop?
+                // Seems like it should be more decoupled from rendering,
+                // especially in case of failure.
+                ws_tx.send(ws_message).await?;
                 app.messages.push(message);
                 app.text_area.update(TextAreaAction::Clear);
             }
@@ -541,7 +589,7 @@ async fn connect_to_server(url: Url, action_tx: mpsc::Sender<Action>) -> anyhow:
     let action = new_status_msg_action(msg);
     action_tx.send(action).await?;
 
-    // TODO: Add timeout / retry?
+    // TODO: Retry in case of timeout?
     let timeout_secs = 3;
     let timeout_duration = Duration::from_secs(timeout_secs);
     let conn_fut = connect_async(url);
