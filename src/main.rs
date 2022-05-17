@@ -1,18 +1,24 @@
+mod component;
+mod text_area;
+
 use chrono::{DateTime, Local};
 use clap::Parser;
 /// Based on the tui-rs user_input example
 /// https://github.com/fdehau/tui-rs/blob/a6b25a487786534205d818a76acb3989658ae58c/examples/user_input.rs
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{error::Error, io, sync::Arc, time::Duration};
+use std::{
+    fs::create_dir_all,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use text_area::TextArea;
 use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
     net::TcpStream,
     select,
     sync::{mpsc, oneshot, watch, RwLock},
@@ -20,17 +26,19 @@ use tokio::{
     try_join,
 };
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use unicode_width::UnicodeWidthStr;
 use url::Url;
+
+use crate::text_area::Action as TextAreaAction;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -42,11 +50,18 @@ type AppLock = Arc<RwLock<App>>;
 // TODO binary/text message modes
 // TODO Allow quitting w/ control-c even if a task hangs
 // TODO Disconnect / reconnect to server
+// TODO Component trait for composable UI elements
 
 #[derive(Parser)]
 struct CliOpts {
+    /// Host part of target WS server address
     host: String,
+    /// Port of target WS server
     port: u16,
+    /// Log file to append to (since stdout/stderr is occupied with the TUI)
+    /// I suggest running `tail -f` in another terminal window alongside wstui.
+    #[clap(short, default_value = "/tmp/wstui/wstui.log")]
+    log_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -59,17 +74,9 @@ enum InputMode {
 #[derive(Debug)]
 enum Action {
     Quit,
-    Input(InputAction),
+    Input(TextAreaAction),
     NewMessage(Message),
     SetMode(InputMode),
-}
-
-#[derive(Debug)]
-enum InputAction {
-    NewChar(char),
-    Backspace,
-    // NewLine,
-    Send,
 }
 
 #[derive(Debug)]
@@ -98,8 +105,10 @@ enum MessageKind {
 
 /// App holds the state of the application
 struct App {
-    /// Current value of the input box
-    input: String,
+    // /// Current value of the input box
+    // input: String,
+    /// Text input area
+    text_area: TextArea,
     /// Current input mode
     input_mode: InputMode,
     /// History of recorded messages
@@ -112,7 +121,7 @@ impl App {
     pub fn new(opts: CliOpts) -> Self {
         let target_url = format!("ws://{}:{}", opts.host, opts.port);
         Self {
-            input: String::new(),
+            text_area: TextArea::new(),
             input_mode: InputMode::Editing,
             messages: Vec::new(),
             target: target_url.parse().expect("Invalid target URL"),
@@ -120,22 +129,33 @@ impl App {
     }
 }
 
+/// Configure tracing (logging)
+fn setup_tracing(log_path: &Path) -> io::Result<WorkerGuard> {
+    // Set up logging
+    if let Some(log_dir) = log_path.parent() {
+        // Create directory if it doesn't exist already
+        create_dir_all(log_dir)?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+    tracing_subscriber::fmt().with_writer(non_blocking).init();
+
+    Ok(guard)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     // Get env vars from .env if present
     dotenv::dotenv().ok();
 
     // Get command line opts
     let opts = CliOpts::parse();
 
-    // Set up logging
-    let log_path = "/tmp/wstui.log";
-    let log_file = std::fs::OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open(log_path)?;
-    let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
-    tracing_subscriber::fmt().with_writer(non_blocking).init();
+    let _log_guard = setup_tracing(&opts.log_path)?;
 
     info!("");
     info!("TEST 123");
@@ -185,13 +205,25 @@ fn get_action_from_key_event(key: KeyEvent, app: &App) -> Option<Action> {
 
 /// Handle key inputs in edit mode
 fn handle_edit_input(key: KeyEvent, _app: &App) -> Option<Action> {
+    use KeyCode::*;
     info!("Key press: {:?}", key);
     match (key.code, key.modifiers) {
-        (KeyCode::Enter, _) => Some(Action::Input(InputAction::Send)),
-        // (KeyCode::Enter, KeyModifiers::NONE) => Some(Action::Input(InputAction::NewLine)),
-        (KeyCode::Char(c), _) => Some(Action::Input(InputAction::NewChar(c))),
-        (KeyCode::Backspace, _) => Some(Action::Input(InputAction::Backspace)),
-        (KeyCode::Esc, _) => Some(Action::SetMode(InputMode::Normal)),
+        // TODO: Actually send message?
+        // (Enter, _) => Some(Action::Input(TextAreaAction::Clear)),
+        (Enter, _) => Some(Action::Input(TextAreaAction::NewLine)),
+        (Backspace, _) => Some(Action::Input(TextAreaAction::Backspace)),
+        (Esc, _) => Some(Action::SetMode(InputMode::Normal)),
+
+        // Cursor movement
+        (Left, _) => Some(Action::Input(TextAreaAction::MoveLeft)),
+        (Right, _) => Some(Action::Input(TextAreaAction::MoveRight)),
+        (Up, _) => Some(Action::Input(TextAreaAction::MoveUp)),
+        (Down, _) => Some(Action::Input(TextAreaAction::MoveDown)),
+        (Home, _) => Some(Action::Input(TextAreaAction::MoveHome)),
+        (End, _) => Some(Action::Input(TextAreaAction::MoveEnd)),
+
+        (Char(c), _) => Some(Action::Input(TextAreaAction::NewChar(c))),
+
         _ => None,
     }
 }
@@ -326,17 +358,20 @@ async fn update_state<B: Backend>(
                 // Quit this task
                 return Ok(());
             }
-            Action::Input(input_action) => match input_action {
-                InputAction::NewChar(c) => app.input.push(c),
-                InputAction::Backspace => {
-                    app.input.pop();
-                }
-                InputAction::Send => {
-                    let text = app.input.drain(..).collect();
-                    let message = Message::new(text, MessageKind::Outbound);
-                    app.messages.push(message);
-                }
-            },
+            Action::Input(input_action) => app.text_area.update(input_action),
+
+            // Action::Input(input_action) => match input_action {
+            //     TextAreaAction::NewChar(c) => app.input.push(c),
+            //     TextAreaAction::Backspace => {
+            //         app.input.pop();
+            //     }
+            //     TextAreaAction::Send => {
+            //         let text = app.input.drain(..).collect();
+            //         let message = Message::new(text, MessageKind::Outbound);
+            //         app.messages.push(message);
+            //     }
+            //     TextAreaAction::NewLine => todo!(), // TODO
+            // },
             Action::NewMessage(message) => app.messages.push(message),
             Action::SetMode(mode) => {
                 app.input_mode = mode;
@@ -353,19 +388,70 @@ async fn update_state<B: Backend>(
 }
 
 fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
+    let num_input_lines = app.text_area.nlines() as u16;
+    info!("num_input_lines = {}", num_input_lines);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
         .constraints(
             [
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(num_input_lines + 2), // 2 for borders
                 Constraint::Min(1),
             ]
             .as_ref(),
         )
         .split(f.size());
 
+    let help_message = create_help_message(&app);
+    f.render_widget(help_message, chunks[0]);
+
+    let input_area = chunks[1];
+    // let input = create_input(&app);
+    let text_input = app.text_area.render(&input_area);
+    handle_input_cursor(f, &app, &input_area);
+    f.render_widget(text_input, input_area);
+
+    let messages: Vec<ListItem> = app.messages.iter().map(format_message).collect();
+    let messages =
+        List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
+    f.render_widget(messages, chunks[2]);
+}
+
+/// Manage cursor control for the input field
+fn handle_input_cursor<B: Backend>(frame: &mut Frame<B>, app: &App, area: &Rect) {
+    match app.input_mode {
+        InputMode::Normal =>
+            // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
+            {}
+
+        InputMode::Editing => {
+            // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
+            // frame.set_cursor(
+            //     // Put cursor past the end of the input text
+            //     area.x + app.input.width() as u16 + 1,
+            //     // Move one line down, from the border to the input line
+            //     area.y + 1,
+            // )
+
+            frame.set_cursor(
+                area.x + app.text_area.cursor.col as u16 + 1,
+                area.y + app.text_area.cursor.row as u16 + 1,
+            );
+        }
+    }
+}
+
+// fn create_input<'a>(app: &'a App) -> Paragraph<'a> {
+//     Paragraph::new(app.input.as_ref())
+//         .style(match app.input_mode {
+//             InputMode::Normal => Style::default(),
+//             InputMode::Editing => Style::default().fg(Color::Yellow),
+//         })
+//         .block(Block::default().borders(Borders::ALL).title("Input"))
+// }
+
+fn create_help_message(app: &App) -> Paragraph {
     let (msg, style) = match app.input_mode {
         InputMode::Normal => (
             vec![
@@ -390,36 +476,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
     };
     let mut text = Text::from(Spans::from(msg));
     text.patch_style(style);
-    let help_message = Paragraph::new(text);
-    f.render_widget(help_message, chunks[0]);
 
-    let input = Paragraph::new(app.input.as_ref())
-        .style(match app.input_mode {
-            InputMode::Normal => Style::default(),
-            InputMode::Editing => Style::default().fg(Color::Yellow),
-        })
-        .block(Block::default().borders(Borders::ALL).title("Input"));
-    f.render_widget(input, chunks[1]);
-    match app.input_mode {
-        InputMode::Normal =>
-            // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
-            {}
-
-        InputMode::Editing => {
-            // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
-            f.set_cursor(
-                // Put cursor past the end of the input text
-                chunks[1].x + app.input.width() as u16 + 1,
-                // Move one line down, from the border to the input line
-                chunks[1].y + 1,
-            )
-        }
-    }
-
-    let messages: Vec<ListItem> = app.messages.iter().map(format_message).collect();
-    let messages =
-        List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
-    f.render_widget(messages, chunks[2]);
+    Paragraph::new(text)
 }
 
 fn format_message(message: &Message) -> ListItem<'static> {
