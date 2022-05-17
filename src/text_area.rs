@@ -107,24 +107,27 @@ impl TextArea {
             let byte_pos = get_byte_index_from_char_index(line, current_char_pos);
             line.remove(byte_pos);
         } else {
-            // Remove & store the line
-            let line = self.lines.remove(self.cursor.row);
+            // Delete the "newline character"
+            if self.cursor.row > 0 {
+                // Remove & store the line
+                let line = self.lines.remove(self.cursor.row);
 
-            // Move the cursor to the end of the previous line
-            self.move_up();
-            self.move_to_end_of_line();
+                // Move the cursor to the end of the previous line
+                self.move_up();
+                self.move_to_end_of_line();
 
-            // Save the cursor position before inserting
-            let col = self.cursor.col;
-            let line_pos = self.line_pos;
+                // Save the cursor position before inserting
+                let col = self.cursor.col;
+                let line_pos = self.line_pos;
 
-            // Insert the deleted line
-            self.insert_string(line);
+                // Insert the deleted line
+                self.insert_string(line);
 
-            // Move the cursor back to the correct position
-            // (before the inserted string)
-            self.cursor.col = col;
-            self.line_pos = line_pos;
+                // Move the cursor back to the correct position
+                // (before the inserted string)
+                self.cursor.col = col;
+                self.line_pos = line_pos;
+            }
         }
     }
 
