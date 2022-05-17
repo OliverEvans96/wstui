@@ -1,12 +1,16 @@
 mod component;
 mod text_area;
 
+use std::iter;
+
 use chrono::{DateTime, Local};
 use clap::Parser;
 /// Based on the tui-rs user_input example
 /// https://github.com/fdehau/tui-rs/blob/a6b25a487786534205d818a76acb3989658ae58c/examples/user_input.rs
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -75,6 +79,8 @@ enum InputMode {
 enum Action {
     Quit,
     Input(TextAreaAction),
+    /// Send the current contents of the input buffer.
+    SendMessage,
     NewMessage(Message),
     SetMode(InputMode),
 }
@@ -209,7 +215,7 @@ fn handle_edit_input(key: KeyEvent, _app: &App) -> Option<Action> {
     info!("Key press: {:?}", key);
     match (key.code, key.modifiers) {
         // TODO: Actually send message?
-        // (Enter, _) => Some(Action::Input(TextAreaAction::Clear)),
+        (Char('d'), KeyModifiers::CONTROL) => Some(Action::SendMessage),
         (Enter, _) => Some(Action::Input(TextAreaAction::NewLine)),
         (Backspace, _) => Some(Action::Input(TextAreaAction::Backspace)),
         (Esc, _) => Some(Action::SetMode(InputMode::Normal)),
@@ -376,6 +382,13 @@ async fn update_state<B: Backend>(
             Action::SetMode(mode) => {
                 app.input_mode = mode;
             }
+            Action::SendMessage => {
+                let content = app.text_area.content();
+                let message = Message::new(content, MessageKind::Outbound);
+                // TODO: ACTUALLY SEND MESSAGE
+                app.messages.push(message);
+                app.text_area.update(TextAreaAction::Clear);
+            }
         }
 
         info!("drawing.");
@@ -412,7 +425,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &App) {
     handle_input_cursor(f, &app, &input_area);
     f.render_widget(text_input, input_area);
 
-    let messages: Vec<ListItem> = app.messages.iter().map(format_message).collect();
+    let messages: Vec<ListItem> = app
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| format_message(i, msg))
+        .collect();
     let messages =
         List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
     f.render_widget(messages, chunks[2]);
@@ -480,7 +498,7 @@ fn create_help_message(app: &App) -> Paragraph {
     Paragraph::new(text)
 }
 
-fn format_message(message: &Message) -> ListItem<'static> {
+fn format_message(index: usize, message: &Message) -> ListItem<'static> {
     let style = match message.kind {
         MessageKind::Inbound => Style::default().fg(Color::Green),
         MessageKind::Outbound => Style::default().fg(Color::Green),
@@ -488,9 +506,27 @@ fn format_message(message: &Message) -> ListItem<'static> {
     };
 
     let ts_str = message.ts.format("%Y-%m-%d %H:%m:%S");
-    let line = format!("{:?} [{}] {}", message.kind, ts_str, message.text);
 
-    let mut text = Text::from(Spans::from(line));
+    let all_prefix = format!("{}: ", index);
+    // Prefix first line
+    let first_prefix = format!("{:?} [{}]", message.kind, ts_str);
+    // Prefix following lines
+    let follow_prefix = " ".repeat(first_prefix.len());
+
+    // Construct paragraph from message text
+    let prefixes = iter::once(all_prefix.clone() + &first_prefix)
+        .chain(iter::repeat(all_prefix + &follow_prefix));
+
+    let lines: Vec<_> = message
+        .text
+        .lines()
+        .zip(prefixes)
+        .map(|(txt, pre)| format!("{} {}", pre, txt))
+        .map(Spans::from)
+        .collect();
+
+    let mut text = Text { lines };
+
     text.patch_style(style);
 
     ListItem::new(text)
